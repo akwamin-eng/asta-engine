@@ -1,43 +1,71 @@
-from fastapi import FastAPI, Form, HTTPException
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from services import process_text_to_property, save_to_db
+from services import process_text_to_property, save_to_db, supabase
+from fastapi.middleware.cors import CORSMiddleware
+from collections import Counter
 
 app = FastAPI()
 
-# 1. JSON Schema (For your manual testing)
-class MessageInput(BaseModel):
+# Enable CORS for Frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class RawListing(BaseModel):
     text: str
 
 @app.get("/")
-async def root():
-    return {"status": "Asta Engine Online", "brain": "Gemini Resilient"}
+def home():
+    return {"status": "ASTA ENGINE ONLINE", "version": "1.0.0"}
 
-# 2. The JSON Endpoint (Keep this for testing)
 @app.post("/process")
-async def process_manual(input: MessageInput):
-    extracted_data = await process_text_to_property(input.text)
-    if not extracted_data:
+async def process_listing(listing: RawListing):
+    if not listing.text:
+        raise HTTPException(status_code=400, detail="Text is required")
+    
+    # 1. AI Extraction
+    property_data = await process_text_to_property(listing.text)
+    
+    if not property_data:
         raise HTTPException(status_code=500, detail="AI Extraction Failed")
-    saved_record = await save_to_db(extracted_data)
+        
+    # 2. Database Save
+    saved_record = await save_to_db(property_data)
+    
     if not saved_record:
         raise HTTPException(status_code=500, detail="Database Save Failed")
-    return {"status": "success", "data": saved_record}
+        
+    return {"message": "Success", "data": saved_record}
 
-# 3. 🆕 The WhatsApp Endpoint (Twilio Webhook)
-@app.post("/whatsapp")
-async def process_whatsapp(Body: str = Form(...), From: str = Form(...)):
+# 🆕 MARKET PULSE API (Trending Tags)
+@app.get("/api/trends")
+async def get_market_trends():
     """
-    Twilio sends data as Form fields. 
-    'Body' is the message text.
-    'From' is the sender's phone number.
+    Analyzes all active listings to find trending 'Vibes' and locations.
+    Returns the top 5 most common tags.
     """
-    print(f"📩 WhatsApp from {From}: {Body}")
-    
-    # Process exactly like before
-    extracted_data = await process_text_to_property(Body)
-    
-    if extracted_data:
-        await save_to_db(extracted_data)
-        return {"status": "Message received and processed"}
-    else:
-        return {"status": "Could not extract property data"}
+    try:
+        # Fetch all features from Supabase
+        response = supabase.table('properties').select('vibe_features').execute()
+        data = response.data
+        
+        # Flatten the list (convert "Pool, Gym" -> ["Pool", "Gym"])
+        all_tags = []
+        for item in data:
+            if item.get('vibe_features'):
+                # Split by comma, strip whitespace, and uppercase
+                tags = [t.strip().upper() for t in item['vibe_features'].split(',')]
+                all_tags.extend(tags)
+        
+        # Count frequency
+        counts = Counter(all_tags)
+        top_tags = [tag for tag, count in counts.most_common(6)]
+        
+        return {"trending_tags": top_tags}
+    except Exception as e:
+        print(f"Error calculating trends: {e}")
+        return {"trending_tags": []}

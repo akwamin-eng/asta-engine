@@ -1,71 +1,83 @@
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from services import process_text_to_property, save_to_db, supabase
 from fastapi.middleware.cors import CORSMiddleware
-from collections import Counter
+from pydantic import BaseModel
+from typing import Optional, List
+import services
 
 app = FastAPI()
 
-# Enable CORS for Frontend
+# 🔒 STRICT SECURITY SETTINGS
+# Only allow requests from these specific origins
+origins = [
+    "http://localhost:5173",      # Vite Local Dev
+    "http://127.0.0.1:5173",      # Vite Local Dev (Alternative IP)
+    "https://asta.homes",         # ✅ Your Production Domain
+    "https://www.asta.homes",     # ✅ WWW Version
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins,        # Enforce the list above
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST"], # Only allow reading/writing data
     allow_headers=["*"],
 )
 
-class RawListing(BaseModel):
+# --- REQUEST MODELS ---
+class TextRequest(BaseModel):
     text: str
+
+# --- ENDPOINTS ---
 
 @app.get("/")
 def home():
-    return {"status": "ASTA ENGINE ONLINE", "version": "1.0.0"}
+    return {"status": "ASTA Engine Secure & Online"}
 
 @app.post("/process")
-async def process_listing(listing: RawListing):
-    if not listing.text:
-        raise HTTPException(status_code=400, detail="Text is required")
+async def process_listing(request: TextRequest):
+    """
+    1. AI extracts data from text.
+    2. Saves structured data to Supabase.
+    """
+    if not request.text:
+        raise HTTPException(status_code=400, detail="No text provided")
     
     # 1. AI Extraction
-    property_data = await process_text_to_property(listing.text)
+    data = await services.process_text_to_property(request.text)
     
-    if not property_data:
+    if not data:
         raise HTTPException(status_code=500, detail="AI Extraction Failed")
-        
-    # 2. Database Save
-    saved_record = await save_to_db(property_data)
+
+    # 2. Save to DB
+    saved_record = await services.save_to_db(data)
     
-    if not saved_record:
-        raise HTTPException(status_code=500, detail="Database Save Failed")
-        
     return {"message": "Success", "data": saved_record}
 
-# 🆕 MARKET PULSE API (Trending Tags)
 @app.get("/api/trends")
-async def get_market_trends():
+async def get_trends():
     """
-    Analyzes all active listings to find trending 'Vibes' and locations.
-    Returns the top 5 most common tags.
+    Analyzes all listings to find trending tags.
     """
     try:
-        # Fetch all features from Supabase
-        response = supabase.table('properties').select('vibe_features').execute()
-        data = response.data
+        response = services.supabase.table('properties').select("vibe_features").execute()
         
-        # Flatten the list (convert "Pool, Gym" -> ["Pool", "Gym"])
+        # Flatten list of tags: "Pool, Gym" -> ["Pool", "Gym"]
         all_tags = []
-        for item in data:
-            if item.get('vibe_features'):
-                # Split by comma, strip whitespace, and uppercase
-                tags = [t.strip().upper() for t in item['vibe_features'].split(',')]
+        for row in response.data:
+            if row['vibe_features']:
+                # Clean up the string format
+                clean_row = row['vibe_features'].replace('"', '').replace('[', '').replace(']', '')
+                tags = [t.strip() for t in clean_row.split(',')]
                 all_tags.extend(tags)
-        
+
         # Count frequency
+        from collections import Counter
         counts = Counter(all_tags)
-        top_tags = [tag for tag, count in counts.most_common(6)]
+        
+        # Return top 5 most common
+        top_tags = [tag for tag, count in counts.most_common(5) if tag]
         
         return {"trending_tags": top_tags}
     except Exception as e:
-        print(f"Error calculating trends: {e}")
+        print(f"Trend Error: {e}")
         return {"trending_tags": []}

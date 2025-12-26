@@ -1,123 +1,119 @@
-import os
 import json
-import random
+import os
 import google.generativeai as genai
 from supabase import create_client, Client
 from dotenv import load_dotenv
+from pydantic import BaseModel
+from typing import Optional
+from pathlib import Path
 
-# 1. Load Keys
-load_dotenv()
+# 1. BULLETPROOF ENV LOADING
+BASE_DIR = Path(__file__).resolve().parent
+env_path = BASE_DIR / '.env'
+
+if env_path.exists():
+    print(f"✅ Found .env file at: {env_path}")
+    load_dotenv(dotenv_path=env_path)
+else:
+    print(f"❌ ERROR: .env file NOT found at: {env_path}")
+
+# 2. LOAD KEYS (Smart Check)
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-PRIMARY_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash") 
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANON_KEY") or os.getenv("SUPABASE_KEY")
 
-# 2. Configure Services
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-genai.configure(api_key=GOOGLE_API_KEY)
+# Check both common names for the AI key
+GEMINI_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 
-# 3. Resilience Strategy
-FALLBACK_MODELS = [
-    PRIMARY_MODEL,
-    "gemini-1.5-flash",
-    "gemini-1.5-pro",
-    "gemini-2.0-flash-exp",
-    "gemini-1.0-pro"
-]
+if not SUPABASE_KEY:
+    print("❌ CRITICAL: SUPABASE_KEY is missing from .env")
+if not GEMINI_KEY:
+    print("❌ CRITICAL: GOOGLE_API_KEY is missing from .env")
+else:
+    print("✅ AI Key Found.")
 
-# 4. 🇬🇭 GEOGRAPHIC BOUNDARIES (Approximate Box around Ghana)
-GHANA_BOUNDS = {
-    'min_lat': 4.5,  'max_lat': 11.2,
-    'min_long': -3.3, 'max_long': 1.2
-}
-ACCRA_DEFAULT = {'lat': 5.6037, 'long': -0.1870}
+# 3. SETUP CLIENTS
+try:
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    genai.configure(api_key=GEMINI_KEY)
+except Exception as e:
+    print(f"⚠️ Client Setup Warning: {e}")
 
-async def get_ai_response(prompt: str):
-    """
-    Tries to get a response from Google AI, cycling through models if one fails.
-    """
-    models_to_try = list(dict.fromkeys(FALLBACK_MODELS))
+# --- DATA MODELS ---
+class Property(BaseModel):
+    title: str
+    price: float
+    location_name: str
+    lat: float
+    long: float
+    type: str
+    vibe_features: str
+    description: str  
+    image_url: Optional[str] = None
+
+# --- CORE SERVICE ---
+async def process_text_to_property(raw_text: str) -> dict:
+    # Use the model that works
+    model = genai.GenerativeModel('gemini-2.0-flash-exp')
     
-    for model_name in models_to_try:
-        try:
-            print(f"🤖 Attempting with model: {model_name}...")
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content(prompt)
-            return response
-        except Exception as e:
-            print(f"⚠️ Model {model_name} failed: {e}")
-            continue 
-            
-    raise Exception("All AI models failed to respond.")
-
-def validate_coordinates(data):
-    """
-    Checks if coordinates are within Ghana. 
-    If they are 0,0 (Ocean) or way off, force them to Accra.
-    """
-    lat = data.get('lat', 0)
-    long = data.get('long', 0)
-    
-    # Check if null, zero, or outside bounds
-    if (lat == 0 and long == 0) or \
-       not (GHANA_BOUNDS['min_lat'] <= lat <= GHANA_BOUNDS['max_lat']) or \
-       not (GHANA_BOUNDS['min_long'] <= long <= GHANA_BOUNDS['max_long']):
-        
-        print(f"⚠️ Coordinates {lat},{long} are invalid/outside Ghana. Defaulting to Accra.")
-        # We set it to Accra, but rely on the jitter later to separate them
-        data['lat'] = ACCRA_DEFAULT['lat']
-        data['long'] = ACCRA_DEFAULT['long']
-    
-    return data
-
-async def process_text_to_property(raw_text: str):
-    print(f"🧠 Processing: {raw_text[:50]}...")
-
     prompt = f"""
-    Extract real estate data from this text into JSON.
-    For 'lat' and 'long', provide the ACTUAL coordinates for the specific neighborhood mentioned.
-    DO NOT use generic Accra center if possible.
+    You are Asta, an expert Real Estate AI.
+    Extract the listing into this EXACT JSON structure.
     
-    Fields:
-    - title: Short summary.
-    - price: Numeric price in GHS (Assume 1 USD = 15 GHS).
-    - location_name: The specific neighborhood.
-    - type: 'rent' or 'sale'.
-    - lat: Specific latitude.
-    - long: Specific longitude.
-    - vibe_features: Keywords.
-
-    Text: "{raw_text}"
-    Return ONLY valid JSON.
+    {{
+      "title": "Short catchy title",
+      "price": 12345 (Number only, convert to GHS),
+      "location_name": "Neighborhood Name",
+      "lat": 5.123,
+      "long": -0.123,
+      "type": "rent" or "sale",
+      "vibe_features": "TAG1, TAG2, TAG3",
+      "description": "Write a 2-sentence marketing summary here. Make it professional."
+    }}
+    
+    RAW TEXT:
+    {raw_text}
     """
-
+    
     try:
-        # 1. Get AI Response (Resilient)
-        response = await get_ai_response(prompt)
-        cleaned_response = response.text.replace('```json', '').replace('```', '').strip()
-        data = json.loads(cleaned_response)
+        response = model.generate_content(
+            prompt,
+            generation_config={"response_mime_type": "application/json"}
+        )
         
-        # 2. 🛡️ Validate Location (The Shield)
-        data = validate_coordinates(data)
+        data = json.loads(response.text)
+
+        # Handle List vs Dict
+        if isinstance(data, list):
+            if len(data) > 0:
+                data = data[0]
+            else:
+                return None
+
+        print("------------------------------------------------")
+        print("🤖 AI DESCRIPTION:", data.get("description"))
+        print("------------------------------------------------")
         
-        # 3. Add Random Jitter (So pins don't stack perfectly on top of each other)
-        data['lat'] += random.uniform(-0.002, 0.002)
-        data['long'] += random.uniform(-0.002, 0.002)
-        
-        data['status'] = 'active'
-        
-        print(f"✅ Extracted: {data['location_name']} @ {data['lat']:.4f}, {data['long']:.4f}")
         return data
 
     except Exception as e:
-        print(f"❌ Extraction Error: {e}")
-        return None
+        print(f"❌ AI Error: {e}")
+        # Fallback to older model
+        try:
+             print("⚠️ Retrying with gemini-1.5-flash...")
+             model_backup = genai.GenerativeModel('gemini-1.5-flash')
+             response = model_backup.generate_content(prompt, generation_config={"response_mime_type": "application/json"})
+             data = json.loads(response.text)
+             if isinstance(data, list): data = data[0]
+             return data
+        except Exception as e2:
+             print(f"❌ Backup failed: {e2}")
+             return None
 
 async def save_to_db(property_data: dict):
     try:
+        print(f"💾 Saving: {property_data.get('title')}")
         response = supabase.table('properties').insert(property_data).execute()
-        print("💾 Saved to Database!")
         return response.data
     except Exception as e:
-        print(f"❌ Database Error: {e}")
+        print(f"❌ DB Error: {e}")
         return None

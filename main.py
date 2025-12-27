@@ -36,8 +36,6 @@ class FeedbackRequest(BaseModel):
 def parse_intent(text: str):
     """
     Extracts structured search data from natural language.
-    Example: "Looking for 2 bed in East Legon under 5000"
-    Returns: {'location': 'East Legon', 'max_price': 5000, 'type': 'rent'}
     """
     text = text.lower()
     intent = {
@@ -46,32 +44,26 @@ def parse_intent(text: str):
         "type": "rent" # Default to rent for now
     }
 
-    # 1. Detect Location (from Atlas/Knowledge Base)
     known_locations = ["east legon", "cantonments", "osu", "labone", "airport", "oyarifa", "adenta", "dzorwulu", "abelemkpe", "tema"]
     for loc in known_locations:
         if loc in text:
             intent["location"] = loc
             break
     
-    # 2. Detect Price (Robust)
-    # Matches: "under 5000", "max 5k", "budget 5,000", "less than 2000"
-    # The regex allows for whitespace (\s*) and optional commas in numbers
     price_pattern = r'(?:under|max|budget|below|less than|limit)\s*[:]?\s*(\d+(?:,\d{3})*(?:k|000)?)'
     price_match = re.search(price_pattern, text)
     
     if price_match:
-        # Clean the string: remove commas, replace 'k' with '000'
         raw_val = price_match.group(1).replace(',', '').replace('k', '000')
         try:
             intent["max_price"] = int(raw_val)
         except:
-            pass # Keep as None if parsing fails
+            pass 
     
-    # 3. Detect Sale vs Rent
     if any(x in text for x in ["buy", "sale", "purchase"]):
         intent["type"] = "sale"
 
-    print(f"🧠 PARSED INTENT: {intent}") # DEBUG LOG
+    print(f"🧠 PARSED INTENT: {intent}")
     return intent
 
 # --- ENDPOINTS ---
@@ -79,6 +71,15 @@ def parse_intent(text: str):
 @app.get("/")
 def home():
     return {"status": "ASTA Engine Secure & Online"}
+
+@app.get("/api/trends")
+def get_trends():
+    """
+    Returns trending location tags for the frontend dashboard.
+    """
+    return {
+        "trending_tags": ["East Legon", "Cantonments", "Osu", "Airport Residential", "Oyarifa", "Spintex"]
+    }
 
 @app.post("/process")
 async def process_listing(request: TextRequest):
@@ -96,16 +97,10 @@ async def process_listing(request: TextRequest):
 
 @app.post("/api/feedback")
 async def submit_feedback(feedback: FeedbackRequest):
-    """
-    1. Records the specific vote in 'trust_votes' (The Ballot)
-    2. Updates the aggregate count in 'properties' (The Scoreboard)
-    """
-    
-    # Map frontend vote types to DB columns
     column_map = {
-        "confirmed": "votes_good", # 'Good' on frontend -> 'votes_good' in DB
-        "sus": "votes_bad",        # 'Sus' on frontend -> 'votes_bad' in DB
-        "scam": "votes_scam"       # 'Scam' on frontend -> 'votes_scam' in DB
+        "confirmed": "votes_good",
+        "sus": "votes_bad", 
+        "scam": "votes_scam"
     }
     
     target_column = column_map.get(feedback.vote_type)
@@ -113,8 +108,6 @@ async def submit_feedback(feedback: FeedbackRequest):
         raise HTTPException(status_code=400, detail="Invalid vote type")
 
     try:
-        # STEP 1: Check if this device already voted on this property
-        # (Prevents ballot stuffing)
         existing_vote = services.supabase.table('trust_votes')\
             .select('*')\
             .eq('property_id', feedback.property_id)\
@@ -122,10 +115,8 @@ async def submit_feedback(feedback: FeedbackRequest):
             .execute()
             
         if existing_vote.data and len(existing_vote.data) > 0:
-            # OPTIONAL: Allow vote changing? For now, we block duplicates.
             return {"message": "Vote already recorded", "status": "duplicate"}
 
-        # STEP 2: Insert the Ballot (trust_votes)
         vote_payload = {
             "property_id": feedback.property_id,
             "device_id": feedback.device_id,
@@ -133,8 +124,6 @@ async def submit_feedback(feedback: FeedbackRequest):
         }
         services.supabase.table('trust_votes').insert(vote_payload).execute()
 
-        # STEP 3: Update the Scoreboard (properties)
-        # Get current count first
         response = services.supabase.table('properties')\
             .select(target_column)\
             .eq('id', feedback.property_id)\
@@ -145,7 +134,6 @@ async def submit_feedback(feedback: FeedbackRequest):
 
         current_count = response.data[0].get(target_column, 0) or 0
         
-        # Increment
         services.supabase.table('properties')\
             .update({target_column: current_count + 1})\
             .eq('id', feedback.property_id)\
@@ -157,31 +145,22 @@ async def submit_feedback(feedback: FeedbackRequest):
         print(f"Vote Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- WHATSAPP BRIDGE (INTELLIGENT) ---
 @app.post("/api/whatsapp")
 async def whatsapp_webhook(Body: str = Form(...), From: str = Form(...)):
-    """
-    The Asta Concierge V2:
-    Now supports price filtering and robust location detection via parse_intent.
-    """
     incoming_msg = Body.strip()
     intent = parse_intent(incoming_msg)
     response_text = ""
 
     if intent["location"]:
-        # We have a target. Let's query Supabase.
         try:
-            # Base Query
             query = services.supabase.table('properties')\
                 .select('title, price, currency, location_name')\
                 .ilike('location_name', f'%{intent["location"]}%')\
                 .eq('status', 'active')
             
-            # Apply Price Filter if detected
             if intent["max_price"]:
-                query = query.lte('price', intent["max_price"]) # lte = Less Than or Equal
+                query = query.lte('price', intent["max_price"])
 
-            # Execute
             results = query.limit(3).execute()
             listings = results.data
             
@@ -193,10 +172,8 @@ async def whatsapp_webhook(Body: str = Form(...), From: str = Form(...)):
                 for item in listings:
                     price = f"{item['currency']} {item['price']:,}"
                     response_text += f"🏡 *{item['title']}*\n💰 {price}\n📍 {item['location_name']}\n\n"
-                
-                response_text += "Reply *'More'* to see others or try a different budget."
+                response_text += "Reply *'More'* to see others."
             else:
-                # Intelligent Fallback
                 price_msg = f" under ₵{intent['max_price']:,}" if intent["max_price"] else ""
                 response_text = f"🚫 I found listings in *{intent['location'].title()}*, but none matched your budget of{price_msg}. \n\nTry increasing your budget?"
                 
@@ -208,10 +185,8 @@ async def whatsapp_webhook(Body: str = Form(...), From: str = Form(...)):
         response_text = "👋 *Asta Scout Commands:*\n\nTry sending details like:\n• _'East Legon under 5000'_\n• _'Buy in Cantonments max 500k'_\n• _'Rent in Osu'_"
     
     else:
-        # Default fallback
         response_text = "I'm listening. Try saying something like *'East Legon under 4000'*."
 
-    # Format Response (TwiML)
     twiml_response = f"""<?xml version="1.0" encoding="UTF-8"?>
     <Response>
         <Message>{response_text}</Message>

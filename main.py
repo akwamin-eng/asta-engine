@@ -50,6 +50,7 @@ def parse_intent(text: str):
             intent["location"] = loc
             break
     
+    # Regex to handle "under 5k", "max 5000", "budget 5,000"
     price_pattern = r'(?:under|max|budget|below|less than|limit)\s*[:]?\s*(\d+(?:,\d{3})*(?:k|000)?)'
     price_match = re.search(price_pattern, text)
     
@@ -83,17 +84,39 @@ def get_trends():
 
 @app.post("/process")
 async def process_listing(request: TextRequest):
+    """
+    Ingests raw text, uses AI to extract data, and attempts to save to DB.
+    Handles 'Ghost Listing' rejection gracefully.
+    """
     if not request.text:
         raise HTTPException(status_code=400, detail="No text provided")
     
-    data = await services.process_text_to_property(request.text)
-    
-    if not data:
-        raise HTTPException(status_code=500, detail="AI Extraction Failed")
+    # 1. AI Extraction
+    try:
+        data = await services.process_text_to_property(request.text)
+    except Exception as e:
+        print(f"❌ AI Extraction Error: {e}")
+        raise HTTPException(status_code=500, detail="AI Service Interrupted")
 
-    saved_record = await services.save_to_db(data)
-    
-    return {"message": "Success", "data": saved_record}
+    if not data:
+        raise HTTPException(status_code=422, detail="AI could not extract valid property data")
+
+    # 2. Database Save (Protected by "The Shield" Constraints)
+    try:
+        saved_record = await services.save_to_db(data)
+        return {"message": "Success", "data": saved_record}
+    except Exception as e:
+        # If the DB rejects it (missing lat/long, no title, etc.)
+        error_msg = str(e)
+        print(f"🛡️ DB REJECTED LISTING: {error_msg}")
+        
+        if "check_active_requirements" in error_msg:
+            raise HTTPException(
+                status_code=422, 
+                detail="Listing Rejected: Missing critical data (Location, Price, or Title)."
+            )
+        
+        raise HTTPException(status_code=500, detail=f"Database Error: {error_msg}")
 
 @app.post("/api/feedback")
 async def submit_feedback(feedback: FeedbackRequest):
@@ -108,6 +131,7 @@ async def submit_feedback(feedback: FeedbackRequest):
         raise HTTPException(status_code=400, detail="Invalid vote type")
 
     try:
+        # Check for duplicate vote from this device
         existing_vote = services.supabase.table('trust_votes')\
             .select('*')\
             .eq('property_id', feedback.property_id)\
@@ -117,6 +141,7 @@ async def submit_feedback(feedback: FeedbackRequest):
         if existing_vote.data and len(existing_vote.data) > 0:
             return {"message": "Vote already recorded", "status": "duplicate"}
 
+        # Record the vote
         vote_payload = {
             "property_id": feedback.property_id,
             "device_id": feedback.device_id,
@@ -124,6 +149,7 @@ async def submit_feedback(feedback: FeedbackRequest):
         }
         services.supabase.table('trust_votes').insert(vote_payload).execute()
 
+        # Update the property counter
         response = services.supabase.table('properties')\
             .select(target_column)\
             .eq('id', feedback.property_id)\
@@ -153,10 +179,12 @@ async def whatsapp_webhook(Body: str = Form(...), From: str = Form(...)):
 
     if intent["location"]:
         try:
+            # Query the database
+            # [Phase 1 Update] using 'location_name' which matches our new schema
             query = services.supabase.table('properties')\
                 .select('title, price, currency, location_name')\
                 .ilike('location_name', f'%{intent["location"]}%')\
-                .eq('status', 'active')
+                .eq('status', 'active') # Only active, verified listings
             
             if intent["max_price"]:
                 query = query.lte('price', intent["max_price"])
@@ -170,7 +198,8 @@ async def whatsapp_webhook(Body: str = Form(...), From: str = Form(...)):
                 
                 response_text = f"🔎 *Found {len(listings)} listings in {loc_title}{price_msg}:*\n\n"
                 for item in listings:
-                    price = f"{item['currency']} {item['price']:,}"
+                    currency = item.get('currency', 'GHS')
+                    price = f"{currency} {item['price']:,}"
                     response_text += f"🏡 *{item['title']}*\n💰 {price}\n📍 {item['location_name']}\n\n"
                 response_text += "Reply *'More'* to see others."
             else:

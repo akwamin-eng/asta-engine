@@ -26,6 +26,7 @@ app.add_middleware(
 # --- MODELS ---
 class TextRequest(BaseModel):
     text: str
+    user_id: Optional[str] = None  # <--- GENTLE UPDATE: Accepts User ID
 
 class FeedbackRequest(BaseModel):
     property_id: int
@@ -101,7 +102,12 @@ async def process_listing(request: TextRequest):
     if not data:
         raise HTTPException(status_code=422, detail="AI could not extract valid property data")
 
-    # 2. Database Save (Protected by "The Shield" Constraints)
+    # 2. Attach Owner ID (The Critical Link)
+    if request.user_id:
+        print(f"👤 Linking Asset to Owner ID: {request.user_id}")
+        data['owner_id'] = request.user_id
+
+    # 3. Database Save (Protected by "The Shield" Constraints)
     try:
         saved_record = await services.save_to_db(data)
         return {"message": "Success", "data": saved_record}
@@ -180,7 +186,6 @@ async def whatsapp_webhook(Body: str = Form(...), From: str = Form(...)):
     if intent["location"]:
         try:
             # Query the database
-            # [Phase 1 Update] using 'location_name' which matches our new schema
             query = services.supabase.table('properties')\
                 .select('title, price, currency, location_name')\
                 .ilike('location_name', f'%{intent["location"]}%')\
